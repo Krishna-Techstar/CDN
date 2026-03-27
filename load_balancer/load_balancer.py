@@ -8,17 +8,16 @@ import time
 import threading
 import requests
 from flask import Flask, jsonify, request, Response
+import sys
+import os
+
+# Add parent directory to path to import database
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from database import db
 
 app = Flask(__name__)
 
-# ─── Edge Server Registry ──────────────────────────────────────────────────────
-# Each entry: { url, id, latency_ms, healthy, last_check, fail_count }
-EDGE_SERVERS = [
-    {"id": "edge1", "url": "http://localhost:8001", "latency_ms": 999, "healthy": True, "last_check": 0, "fail_count": 0},
-    {"id": "edge2", "url": "http://localhost:8002", "latency_ms": 999, "healthy": True, "last_check": 0, "fail_count": 0},
-    {"id": "edge3", "url": "http://localhost:8003", "latency_ms": 999, "healthy": True, "last_check": 0, "fail_count": 0},
-]
-
+# ─── Edge Server Registry (now loaded from database) ───────────────────────────
 HEALTH_CHECK_INTERVAL = 10   # seconds between health checks
 MAX_FAIL_COUNT = 3           # mark unhealthy after this many consecutive failures
 registry_lock = threading.Lock()
@@ -30,6 +29,21 @@ lb_stats = {
     "failed_routes": 0,
 }
 stats_lock = threading.Lock()
+
+
+def initialize_edge_servers():
+    """Initialize default edge servers in database if not exists."""
+    default_edges = [
+        {"id": "edge1", "url": "http://localhost:8001"},
+        {"id": "edge2", "url": "http://localhost:8002"},
+        {"id": "edge3", "url": "http://localhost:8003"},
+    ]
+    for edge in default_edges:
+        db.register_edge_server(edge["id"], edge["url"])
+
+
+# Initialize on startup
+initialize_edge_servers()
 
 
 # ─── Health Check Loop ─────────────────────────────────────────────────────────
@@ -50,23 +64,24 @@ def measure_latency(edge: dict) -> float:
 def run_health_checks():
     """Background thread: continuously checks all edge servers."""
     while True:
-        with registry_lock:
-            for edge in EDGE_SERVERS:
-                latency = measure_latency(edge)
-                edge["last_check"] = time.time()
+        edges = db.get_edge_servers()
+        for edge in edges:
+            latency = measure_latency(edge)
+            healthy = latency != float("inf")
 
-                if latency == float("inf"):
-                    edge["fail_count"] += 1
-                    if edge["fail_count"] >= MAX_FAIL_COUNT:
-                        if edge["healthy"]:
-                            print(f"[LB] ⚠️  Edge '{edge['id']}' marked UNHEALTHY (failed {edge['fail_count']}x)")
-                        edge["healthy"] = False
-                else:
-                    if not edge["healthy"]:
-                        print(f"[LB] ✅  Edge '{edge['id']}' RECOVERED (latency={latency:.1f}ms)")
-                    edge["latency_ms"] = round(latency, 2)
-                    edge["healthy"] = True
-                    edge["fail_count"] = 0
+            # Update health status in database
+            db.update_edge_health(edge["edge_id"], latency if healthy else 999, healthy)
+
+            # Log health check
+            db.log_health_check(edge["edge_id"], latency if healthy else 999, healthy, latency if healthy else 0)
+
+            if not healthy:
+                fail_count = edge.get("fail_count", 0) + 1
+                if fail_count >= MAX_FAIL_COUNT and edge.get("healthy", True):
+                    print(f"[LB] ⚠️  Edge '{edge['edge_id']}' marked UNHEALTHY (failed {fail_count}x)")
+            else:
+                if not edge.get("healthy", True):
+                    print(f"[LB] ✅  Edge '{edge['edge_id']}' RECOVERED (latency={latency:.1f}ms)")
 
         time.sleep(HEALTH_CHECK_INTERVAL)
 
@@ -76,8 +91,8 @@ def select_best_edge() -> dict | None:
     Latency-based selection: choose the healthy edge with lowest measured latency.
     Falls back to round-robin if all latencies are equal.
     """
-    with registry_lock:
-        healthy = [e for e in EDGE_SERVERS if e["healthy"]]
+    edges = db.get_edge_servers()
+    healthy = [e for e in edges if e.get("healthy", True)]
     if not healthy:
         return None
     return min(healthy, key=lambda e: e["latency_ms"])
@@ -101,7 +116,7 @@ def proxy_request(filename: str):
         return jsonify({"error": "No healthy edge servers available"}), 503
 
     target_url = f"{edge['url']}/get/{filename}"
-    print(f"[LB] Routing '{filename}' → {edge['id']} (latency={edge['latency_ms']}ms)")
+    print(f"[LB] Routing '{filename}' → {edge['edge_id']} (latency={edge['latency_ms']}ms)")
 
     try:
         start = time.time()
@@ -117,7 +132,7 @@ def proxy_request(filename: str):
             status=upstream.status_code,
             content_type=upstream.headers.get("Content-Type", "text/plain"),
             headers={
-                "X-LB-Selected-Edge": edge["id"],
+                "X-LB-Selected-Edge": edge["edge_id"],
                 "X-LB-Edge-Latency": f"{edge['latency_ms']}ms",
                 "X-LB-Proxy-Time": f"{elapsed:.1f}ms",
                 "X-Cache": upstream.headers.get("X-Cache", "UNKNOWN"),
@@ -183,8 +198,8 @@ def invalidate_all():
 @app.route("/edges", methods=["GET"])
 def list_edges():
     """Return the current state of all registered edge servers."""
-    with registry_lock:
-        return jsonify({"edges": EDGE_SERVERS, "count": len(EDGE_SERVERS)})
+    edges = db.get_edge_servers()
+    return jsonify({"edges": edges, "count": len(edges)})
 
 
 @app.route("/edges/register", methods=["POST"])
@@ -194,19 +209,10 @@ def register_edge():
     if not data or "id" not in data or "url" not in data:
         return jsonify({"error": "Provide 'id' and 'url'"}), 400
 
-    new_edge = {
-        "id": data["id"],
-        "url": data["url"],
-        "latency_ms": 999,
-        "healthy": True,
-        "last_check": 0,
-        "fail_count": 0,
-    }
-    with registry_lock:
-        EDGE_SERVERS.append(new_edge)
+    db.register_edge_server(data["id"], data["url"])
 
     print(f"[LB] Registered new edge: {data['id']} at {data['url']}")
-    return jsonify({"status": "registered", "edge": new_edge}), 201
+    return jsonify({"status": "registered", "edge": {"id": data["id"], "url": data["url"]}}), 201
 
 
 @app.route("/stats", methods=["GET"])

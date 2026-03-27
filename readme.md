@@ -21,10 +21,26 @@ Client
 
 ---
 
+## 💾 Database Integration
+
+The CDN uses SQLite for persistent storage of:
+
+- **Metrics Data**: Request counts, cache hits/misses, response times, per-file statistics
+- **Cache Metadata**: Cached file information, TTL timestamps, content types
+- **Edge Registry**: Load balancer's edge server registry with health status
+- **Request Logs**: Detailed request history with timestamps and client information
+
+Database file: `cdn.db` (created automatically on first run)
+
+---
+
 ## 📁 Project Structure
 
 ```
 mini-cdn/
+├── database.py                 # SQLite database utilities and models
+├── init_db.py                  # Database initialization script
+├── cdn.db                      # SQLite database (created on first run)
 ├── origin_server/
 │   └── origin_server.py       # Serves original files
 ├── edge_server/
@@ -48,13 +64,19 @@ mini-cdn/
 pip install -r requirements.txt
 ```
 
-### 2. Start all servers (without NGINX)
+### 2. Initialize database (optional)
+```bash
+python init_db.py
+```
+This creates the SQLite database schema. The database is also created automatically when you first run any server.
+
+### 3. Start all servers (without NGINX)
 ```bash
 chmod +x start_cdn.sh
 ./start_cdn.sh start
 ```
 
-### 3. (Optional) Run with NGINX
+### 4. (Optional) Run with NGINX
 ```bash
 sudo nginx -c $(pwd)/nginx/nginx.conf
 ```
@@ -107,6 +129,7 @@ sudo nginx -c $(pwd)/nginx/nginx.conf
 | GET    | `/metrics`                | Full system metrics (JSON)       |
 | GET    | `/metrics/edge/<edge_id>` | Per-edge metrics                 |
 | GET    | `/metrics/files`          | Per-file request breakdown       |
+| GET    | `/metrics/logs`           | Request logs (with filters)      |
 | POST   | `/metrics/reset`          | Reset all metrics                |
 | POST   | `/report`                 | (Internal) Edge reports here     |
 

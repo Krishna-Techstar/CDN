@@ -8,33 +8,18 @@ import time
 import threading
 import requests
 from flask import Flask, jsonify, request
-from collections import defaultdict, deque
+from collections import deque
+import sys
+import os
+
+# Add parent directory to path to import database
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from database import db
 
 app = Flask(__name__)
 
-# ─── Global Metrics Store (in-memory) ─────────────────────────────────────────
+# ─── Global Metrics Store (now in database) ───────────────────────────────────
 metrics_lock = threading.Lock()
-
-global_stats = {
-    "total_requests": 0,
-    "cache_hits": 0,
-    "cache_misses": 0,
-    "total_response_time_ms": 0.0,
-    "start_time": time.time(),
-}
-
-# Per-edge stats: { edge_id: { hits, misses, requests, total_response_time_ms } }
-edge_stats = defaultdict(lambda: {
-    "cache_hits": 0,
-    "cache_misses": 0,
-    "total_requests": 0,
-    "total_response_time_ms": 0.0,
-    "latency_ms": 0.0,
-    "status": "unknown",
-})
-
-# Per-file stats: { filename: { hits, misses, requests } }
-file_stats = defaultdict(lambda: {"hits": 0, "misses": 0, "requests": 0})
 
 # Rolling window of recent requests for requests-per-second calculation
 recent_requests = deque()  # stores timestamps of last 60s of requests
@@ -60,17 +45,30 @@ def calculate_rps() -> float:
 
 
 def get_hit_ratio() -> float:
-    total = global_stats["total_requests"]
+    """Get cache hit ratio from database."""
+    global_metrics = db.get_global_metrics()
+    total = global_metrics.get("total_requests", 0)
     if total == 0:
         return 0.0
-    return round(global_stats["cache_hits"] / total, 4)
+    hits = global_metrics.get("cache_hits", 0)
+    return round(hits / total, 4)
 
 
 def get_avg_response_time() -> float:
-    total = global_stats["total_requests"]
+    """Get average response time from database."""
+    global_metrics = db.get_global_metrics()
+    total = global_metrics.get("total_requests", 0)
     if total == 0:
         return 0.0
-    return round(global_stats["total_response_time_ms"] / total, 2)
+    total_time = global_metrics.get("total_response_time_ms", 0.0)
+    return round(total_time / total, 2)
+
+
+def get_uptime() -> float:
+    """Get system uptime from database."""
+    global_metrics = db.get_global_metrics()
+    start_time = global_metrics.get("start_time", time.time())
+    return round(time.time() - start_time, 1)
 
 
 # ─── Routes ────────────────────────────────────────────────────────────────────
@@ -91,28 +89,35 @@ def report():
     response_time = data.get("response_time_ms", 0.0)
 
     with metrics_lock:
-        # Update global stats
-        global_stats["total_requests"] += 1
-        global_stats["total_response_time_ms"] += response_time
-        if cache_hit:
-            global_stats["cache_hits"] += 1
-        else:
-            global_stats["cache_misses"] += 1
+        # Update global stats in database
+        db.update_global_metrics(
+            total_requests=1,
+            cache_hits=1 if cache_hit else 0,
+            cache_misses=0 if cache_hit else 1,
+            total_response_time_ms=response_time
+        )
 
-        # Update per-edge stats
-        edge_stats[edge_id]["total_requests"] += 1
-        edge_stats[edge_id]["total_response_time_ms"] += response_time
-        if cache_hit:
-            edge_stats[edge_id]["cache_hits"] += 1
-        else:
-            edge_stats[edge_id]["cache_misses"] += 1
+        # Update per-edge stats in database
+        db.update_edge_metrics(
+            edge_id=edge_id,
+            total_requests=1,
+            cache_hits=1 if cache_hit else 0,
+            cache_misses=0 if cache_hit else 1,
+            total_response_time_ms=response_time
+        )
 
-        # Update per-file stats
-        file_stats[filename]["requests"] += 1
-        if cache_hit:
-            file_stats[filename]["hits"] += 1
-        else:
-            file_stats[filename]["misses"] += 1
+        # Update per-file stats in database
+        db.update_file_metrics(
+            filename=filename,
+            requests=1,
+            hits=1 if cache_hit else 0,
+            misses=0 if cache_hit else 1
+        )
+
+        # Log the request
+        client_ip = request.remote_addr
+        user_agent = request.headers.get('User-Agent')
+        db.log_request(edge_id, filename, cache_hit, response_time, client_ip, user_agent)
 
         # Track request timestamp for RPS
         recent_requests.append(time.time())
@@ -126,62 +131,74 @@ def metrics():
     Main metrics endpoint — consumed by dashboards and monitoring tools.
     Returns comprehensive system-wide stats.
     """
-    uptime = round(time.time() - global_stats["start_time"], 1)
+    global_metrics = db.get_global_metrics()
+    uptime = get_uptime()
 
     # Build per-edge summary
+    edges_data = db.get_edge_metrics()
     edges_summary = {}
-    with metrics_lock:
-        for eid, estats in edge_stats.items():
-            total = estats["total_requests"]
-            edges_summary[eid] = {
-                "total_requests": total,
-                "cache_hits": estats["cache_hits"],
-                "cache_misses": estats["cache_misses"],
-                "hit_ratio": round(estats["cache_hits"] / total, 3) if total > 0 else 0,
-                "avg_response_time_ms": round(
-                    estats["total_response_time_ms"] / total, 2
-                ) if total > 0 else 0,
-                "latency_ms": estats.get("latency_ms", 0),
-                "status": estats.get("status", "unknown"),
-            }
+    for edge in edges_data:
+        total = edge["total_requests"]
+        edges_summary[edge["edge_id"]] = {
+            "total_requests": total,
+            "cache_hits": edge["cache_hits"],
+            "cache_misses": edge["cache_misses"],
+            "hit_ratio": round(edge["cache_hits"] / total, 3) if total > 0 else 0,
+            "avg_response_time_ms": round(
+                edge["total_response_time_ms"] / total, 2
+            ) if total > 0 else 0,
+            "latency_ms": edge["latency_ms"],
+            "status": edge["status"],
+        }
 
-        # Top 5 most requested files
-        top_files = sorted(
-            [{"file": f, **s} for f, s in file_stats.items()],
-            key=lambda x: x["requests"],
-            reverse=True,
-        )[:5]
-
-        return jsonify({
-            "system": {
-                "uptime_seconds": uptime,
-                "requests_per_second": calculate_rps(),
-                "total_requests": global_stats["total_requests"],
-                "cache_hits": global_stats["cache_hits"],
-                "cache_misses": global_stats["cache_misses"],
-                "hit_ratio": get_hit_ratio(),
-                "avg_response_time_ms": get_avg_response_time(),
-            },
-            "edges": edges_summary,
-            "top_files": top_files,
+    # Top files from database
+    top_files_data = db.get_file_metrics(limit=5)
+    top_files = []
+    for file_data in top_files_data:
+        total = file_data["requests"]
+        top_files.append({
+            "file": file_data["filename"],
+            "requests": total,
+            "hits": file_data["hits"],
+            "misses": file_data["misses"],
+            "hit_ratio": round(file_data["hits"] / total, 3) if total > 0 else 0,
         })
+
+    return jsonify({
+        "system": {
+            "uptime_seconds": uptime,
+            "requests_per_second": calculate_rps(),
+            "total_requests": global_metrics.get("total_requests", 0),
+            "cache_hits": global_metrics.get("cache_hits", 0),
+            "cache_misses": global_metrics.get("cache_misses", 0),
+            "hit_ratio": get_hit_ratio(),
+            "avg_response_time_ms": get_avg_response_time(),
+        },
+        "edges": edges_summary,
+        "top_files": top_files,
+    })
 
 
 @app.route("/metrics/edge/<edge_id>", methods=["GET"])
 def edge_metrics(edge_id: str):
     """Return metrics for a specific edge server."""
-    with metrics_lock:
-        if edge_id not in edge_stats:
-            return jsonify({"error": f"No data for edge '{edge_id}'"}), 404
-        estats = dict(edge_stats[edge_id])
+    edge_data = db.get_edge_metrics(edge_id)
+    if not edge_data:
+        return jsonify({"error": f"No data for edge '{edge_id}'"}), 404
 
-    total = estats["total_requests"]
+    edge = edge_data[0]
+    total = edge["total_requests"]
     return jsonify({
         "edge": edge_id,
-        **estats,
-        "hit_ratio": round(estats["cache_hits"] / total, 3) if total > 0 else 0,
+        "total_requests": total,
+        "cache_hits": edge["cache_hits"],
+        "cache_misses": edge["cache_misses"],
+        "total_response_time_ms": edge["total_response_time_ms"],
+        "latency_ms": edge["latency_ms"],
+        "status": edge["status"],
+        "hit_ratio": round(edge["cache_hits"] / total, 3) if total > 0 else 0,
         "avg_response_time_ms": round(
-            estats["total_response_time_ms"] / total, 2
+            edge["total_response_time_ms"] / total, 2
         ) if total > 0 else 0,
     })
 
@@ -189,34 +206,29 @@ def edge_metrics(edge_id: str):
 @app.route("/metrics/files", methods=["GET"])
 def file_metrics():
     """Return per-file request breakdown."""
-    with metrics_lock:
-        files = [
-            {
-                "file": fname,
-                **fstats,
-                "hit_ratio": round(fstats["hits"] / fstats["requests"], 3)
-                if fstats["requests"] > 0 else 0,
-            }
-            for fname, fstats in file_stats.items()
-        ]
-    return jsonify({"files": sorted(files, key=lambda x: x["requests"], reverse=True)})
-
-
-@app.route("/metrics/reset", methods=["POST"])
-def reset_metrics():
-    """Reset all collected metrics (useful for testing)."""
-    with metrics_lock:
-        global_stats.update({
-            "total_requests": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "total_response_time_ms": 0.0,
-            "start_time": time.time(),
+    files_data = db.get_file_metrics(limit=100)  # Get all files
+    files = []
+    for file_data in files_data:
+        requests = file_data["requests"]
+        files.append({
+            "file": file_data["filename"],
+            "requests": requests,
+            "hits": file_data["hits"],
+            "misses": file_data["misses"],
+            "hit_ratio": round(file_data["hits"] / requests, 3) if requests > 0 else 0,
         })
-        edge_stats.clear()
-        file_stats.clear()
-        recent_requests.clear()
-    return jsonify({"status": "metrics reset"})
+    return jsonify({"files": files})
+
+
+@app.route("/metrics/logs", methods=["GET"])
+def request_logs():
+    """Return recent request logs."""
+    limit = int(request.args.get("limit", 100))
+    edge_id = request.args.get("edge")
+    filename = request.args.get("file")
+
+    logs = db.get_request_logs(limit=limit, edge_id=edge_id, filename=filename)
+    return jsonify({"logs": logs, "count": len(logs)})
 
 
 @app.route("/health", methods=["GET"])

@@ -9,7 +9,12 @@ import time
 import threading
 import requests
 from flask import Flask, jsonify, Response
-from collections import defaultdict
+import sys
+import os
+
+# Add parent directory to path to import database
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from database import db
 
 app = Flask(__name__)
 
@@ -40,29 +45,71 @@ def is_cache_valid(entry: dict) -> bool:
 
 
 def get_from_cache(filename: str):
-    """Return cached entry if valid, else None."""
+    """Return cached entry if valid, else None. Checks both memory and database."""
     with cache_lock:
+        # Check in-memory cache first
         entry = cache.get(filename)
         if entry and is_cache_valid(entry):
             return entry
         if entry:
-            # Expired — evict it
+            # Expired — evict it from memory and database
             del cache[filename]
+            db.delete_cache_metadata(EDGE_ID, filename)
             print(f"[{EDGE_ID}] Cache EXPIRED for '{filename}'")
+            return None
+
+        # Check database for persisted cache
+        db_metadata = db.get_cache_metadata(EDGE_ID, filename)
+        if db_metadata:
+            meta = db_metadata[0]
+            current_time = time.time()
+            if (current_time - meta["timestamp"]) < meta["ttl"]:
+                # Valid cache in database, load it into memory
+                entry = {
+                    "content": meta["content"],
+                    "content_type": meta.get("content_type", "text/plain"),
+                    "timestamp": meta["timestamp"],
+                    "ttl": meta["ttl"],
+                    "size": meta.get("size_bytes", 0),
+                }
+                cache[filename] = entry
+                print(f"[{EDGE_ID}] Cache loaded from DB: '{filename}'")
+                return entry
+            else:
+                # Expired in database, clean it up
+                db.delete_cache_metadata(EDGE_ID, filename)
+                print(f"[{EDGE_ID}] DB Cache EXPIRED for '{filename}'")
+
         return None
 
 
 def store_in_cache(filename: str, data: dict):
-    """Store fetched content in the local cache."""
+    """Store fetched content in the local cache and persist metadata."""
     with cache_lock:
+        content = data["content"]
+        content_type = data.get("content_type", "text/plain")
+        ttl = data.get("ttl", 60)
+        size = data.get("size", len(content) if isinstance(content, str) else 0)
+
         cache[filename] = {
-            "content": data["content"],
-            "content_type": data.get("content_type", "text/plain"),
+            "content": content,
+            "content_type": content_type,
             "timestamp": time.time(),
-            "ttl": data.get("ttl", 60),
-            "size": data.get("size", 0),
+            "ttl": ttl,
+            "size": size,
         }
-    print(f"[{EDGE_ID}] Cached '{filename}' (TTL={data.get('ttl', 60)}s)")
+
+        # Persist metadata and content to database
+        db.set_cache_metadata(
+            edge_id=EDGE_ID,
+            filename=filename,
+            content=content if isinstance(content, str) else str(content),
+            content_type=content_type,
+            ttl=ttl,
+            size_bytes=size
+        )
+
+    print(f"[{EDGE_ID}] Cached '{filename}' (TTL={ttl}s)")
 
 
 def fetch_from_origin(filename: str):
@@ -163,6 +210,9 @@ def invalidate():
     with cache_lock:
         removed = cache.pop(filename, None)
 
+    # Also remove from database
+    db.delete_cache_metadata(EDGE_ID, filename)
+
     if removed:
         print(f"[{EDGE_ID}] INVALIDATED '{filename}' from cache")
         return jsonify({"status": "invalidated", "file": filename, "edge": EDGE_ID})
@@ -175,6 +225,10 @@ def invalidate_all():
     with cache_lock:
         count = len(cache)
         cache.clear()
+
+    # Also clear from database
+    db.delete_cache_metadata(EDGE_ID)
+
     print(f"[{EDGE_ID}] Flushed entire cache ({count} entries)")
     return jsonify({"status": "flushed", "cleared": count, "edge": EDGE_ID})
 
@@ -183,17 +237,28 @@ def invalidate_all():
 def cache_status():
     """Show what's currently in the cache."""
     with cache_lock:
+        # Clean up expired entries from database
+        db.cleanup_expired_cache(EDGE_ID)
+
+        # Get metadata from database
+        db_metadata = db.get_cache_metadata(EDGE_ID)
+        current_time = time.time()
+
         entries = []
-        for fname, entry in cache.items():
-            age = time.time() - entry["timestamp"]
+        for meta in db_metadata:
+            age = current_time - meta["timestamp"]
+            expires_in = meta["ttl"] - age
             entries.append({
-                "filename": fname,
+                "filename": meta["filename"],
                 "age_seconds": round(age, 1),
-                "ttl": entry["ttl"],
-                "expires_in": round(entry["ttl"] - age, 1),
-                "valid": is_cache_valid(entry),
-                "size": entry.get("size", 0),
+                "ttl": meta["ttl"],
+                "expires_in": round(expires_in, 1),
+                "valid": expires_in > 0,
+                "size": meta.get("size_bytes", 0),
+                "content_type": meta.get("content_type", "unknown"),
+                "in_memory": meta["filename"] in cache,
             })
+
     return jsonify({"edge": EDGE_ID, "cached_files": entries, "count": len(entries)})
 
 
